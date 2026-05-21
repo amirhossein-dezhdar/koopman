@@ -1,0 +1,8 @@
+# Pure residual/safety/input-event diagnostic override.
+# Use this to test whether the controller can run without periodic watchdog replans.
+# Example:
+#   python scripts/run_closed_loop.py --config configs/event_pure.yaml --baseline ours --scenario lane_keeping --name pure_event_lane
+
+extends: default.yaml
+trigger:
+  N_max: 999999

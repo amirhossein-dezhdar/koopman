@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environments
+venv/
+.env/
+
+# Outputs
+runs/
+analysis_outputs*/
+artifacts/data/
+artifacts/diagnostics/
+*.npz
+*.pt
+*.pth
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db

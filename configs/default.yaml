@@ -1,0 +1,218 @@
+# ---- Default config for Conformal Residual-Driven Koopman MPC ----
+
+seed: 42
+
+env:
+  backend: bicycle          # bicycle | metadrive | carla
+  dt: 0.05                  # 20 Hz control loop
+  horizon_seconds: 20.0
+  reference: lane_keeping   # lane_keeping | dlc | cut_in | low_friction | sensor_noise | ood
+
+  bicycle:
+    wheelbase: 2.7          # m
+    mass: 1500.0            # kg
+    Iz: 2250.0              # kg m^2
+    lf: 1.2
+    lr: 1.5
+    Cf: 80000.0             # N/rad
+    Cr: 80000.0             # N/rad
+    mu: 1.0                 # friction multiplier
+
+  metadrive:
+    map: "S"
+    traffic_density: 0.1
+    use_render: false
+
+  carla:
+    host: "127.0.0.1"
+    port: 2000
+    town: "Town04"
+    vehicle: "vehicle.tesla.model3"
+    sync_mode: true
+
+# Data-collection settings are intentionally larger than the old quick demo.
+# The bicycle backend is simple, so collection may still finish quickly; the
+# JSON diagnostics, not wall-clock time, are the source of truth for sufficiency.
+data_collection:
+  episodes: 80
+  min_transitions: 30000
+  py_max: 3.0
+  psi_max: 0.9
+  scenario_schedule: [lane_keeping, dlc, cut_in, low_friction, sensor_noise, ood]
+  policy_modes: [center_probe, sine_sweep, boundary_recovery, speed_sweep]
+  save_summary: true
+
+# Offline training/diagnostic reports. These do not alter the paper formulas;
+# they only make stale artifacts, weak data coverage, and OOD CBF failures
+# visible before closed-loop experiments.
+diagnostics:
+  out_dir: ./artifacts/diagnostics
+  strict_artifact_checks: true
+  min_dataset_transitions: 30000
+  min_calibration_size: 3000
+  max_allowed_cbf_false_safe_lane: 0
+  warn_solve_time_ms: 50
+
+state:
+  dim: 6                    # [px, py, psi, vx, vy, r]
+  names: [px, py, psi, vx, vy, r]
+
+control:
+  dim: 2                    # [steer, accel]
+  bounds:
+    steer:  [-0.5, 0.5]
+    accel:  [-6.0, 3.0]
+  rate_bounds:
+    steer:  [-0.2, 0.2]
+    accel:  [-3.0, 3.0]
+
+koopman:
+  type: edmd                # edmd | deep
+  lifting_dim: 64
+  edmd:
+    n_rbf: 50
+    rbf_width: 1.0
+    # Nonlinear features must exclude absolute position.  The full state is
+    # still preserved as identity coordinates, but x^2/RBF terms are built
+    # only from [psi, vx, vy, r].  This prevents px^2 from exploding during a
+    # normal long drive and poisoning residuals.
+    nonlinear_state_indices: [2, 3, 4, 5]
+  deep:
+    encoder_hidden: [128, 128]
+    train_epochs: 50
+    lr: 1.0e-3
+    batch_size: 256
+  online_update:
+    enabled: false
+    lambda_forget: 0.995
+    residual_trigger_ratio: 1.5
+    consecutive_steps: 3
+
+# Physical residual metric used by conformal calibration, online ACI update,
+# and the model-error part of the event trigger.  It excludes absolute px,
+# whose error is not a lane-safety quantity and grows with path length.
+residual:
+  # Safety-margin residual must live in the same coordinates as the CBF input.
+  # The CBF uses [py, vy], so the conformal bound that tightens the barrier
+  # should NOT include psi/vx/r errors.  Those are still used by the trigger.
+  state_indices: [1, 4]               # [py, vy] for CBF robust margin / ACI
+  trigger_indices: [1, 2, 3, 4, 5]    # [py, psi, vx, vy, r] for model-trigger E_z
+
+conformal:
+  alpha: 0.1                # target miscoverage
+  adaptive: true            # Gibbs & Candes 2021 (ACI)
+  gamma_step: 0.02
+  # 480 transitions from a 6-episode/20s/20Hz run after 80/20 split.
+  # Raise if you collect more episodes (the script will use min(this, available)).
+  calibration_size: 4000
+  window: 500
+  alpha_min: 0.001
+  alpha_max: 0.5
+
+cbf:
+  # CBF sees only lane-safety features [py, vy].  It does NOT see px, so it
+  # cannot learn the spurious artifact "later in the rollout = unsafe".
+  state_indices: [1, 4]
+  hidden: [128, 128, 64]
+  spectral_norm: true
+  gamma: 0.25               # discrete-time barrier rate
+
+  # Keep the CBF neural, but anchor it to a smooth physical lane prior:
+  #   h = h_prior(py, vy) - correction_scale * softplus(g_theta(py, vy)).
+  # The neural term can tighten the safe set, but it cannot make lane-
+  # departure points falsely safe. This fixes the analysis_outputs1 failure.
+  prior:
+    enabled: true
+    mode: lane_quadratic
+    params:
+      py_pos: 0             # CBF feature coordinate 0 == py
+      vy_pos: 1             # CBF feature coordinate 1 == vy
+      py_limit: 1.70        # CBF prior becomes negative before the 1.75 m physical lane limit
+      py_softness: 0.80      # kept for backward compatibility; unused by lane_quadratic
+      py_gain: 1.25
+      vy_limit: 2.0
+      vy_weight: 5.0
+      correction_scale: 0.05
+      smooth_abs_eps: 1.0e-6
+
+  train:
+    epochs: 25
+    lr: 6.0e-4
+    batch_size: 1024
+    lambda_barrier: 0.3     # transition term should regularize, not fight sign/grid geometry
+    lambda_feas: 0.3
+    lambda_spec: 0.002      # hard spectral clipping already controls Lipschitz; keep this mild
+  fallback_Lh: 8.5
+
+mpc:
+  N: 25
+  Q_diag: [5, 5, 1, 1, 1, 0.5]
+  R_diag: [0.1, 0.1]
+  S_diag: [0.5, 0.5]
+  P_terminal_scale: 5.0
+  solver: OSQP
+
+trigger:
+  # σ_k = clip(σ_max − λ_w · w̄_k, σ_min, σ_max).
+  # w̄_k is now the CBF-coordinate residual bound [py, vy], while E_z still
+  # uses the broader physical trigger metric [py, psi, vx, vy, r].
+  sigma_min: 0.03
+  sigma_max: 0.38
+  lambda_w: 0.55
+  eps_safety: 0.35
+  # The previous 0.05 made tiny safety-filter corrections retrigger MPC at
+  # every single step. 0.25 still catches meaningful invalidation but avoids
+  # turning event-triggered MPC into periodic MPC.
+  eps_filter: 0.25
+  # Watchdog/staleness horizon.  v9 used 15 steps (0.75s at dt=0.05), which
+  # made the easy lane-keeping run look periodically triggered.  v10 keeps the
+  # watchdog for safety, but moves it far enough out that residual/safety/input
+  # events are distinguishable in normal plots.  The analyzer reports stale and
+  # non-stale events separately.
+  N_max: 80
+  N_h: 5                    # lookahead horizon for M_h, eq. (19), N_h <= N
+
+safety_filter:
+  H_diag: [1.0, 1.0]
+  lambda_slack: 5.0e4
+  # Emergency is a last resort. It now uses lane-recovery steering + braking,
+  # not straight-line braking. Nominal lane keeping should still have zero or
+  # near-zero emergency events.
+  # Slack alone is no longer allowed to trigger emergency while the vehicle is
+  # physically inside the lane; see controller.py.  This prevents robust-margin
+  # conservatism from collapsing speed.
+  emergency_slack: 0.75
+  emergency_brake: -0.75
+  recovery_k_py: 0.55
+  recovery_k_psi: 0.90
+  recovery_k_vy: 0.18
+  # Pre-violation safety-recovery guard.  This does not remove the CBF; it
+  # prevents the soft-slack CBF-QP from quietly executing unsafe inputs when
+  # the robust margin h-rho or the look-ahead margin M_h is already close to
+  # zero.
+  safety_guard_margin: 0.15
+  lane_guard_buffer: 0.20
+
+lane:
+  half_width: 1.75
+  report_buffer: 0.0
+
+# Reconstruction / sensing / linearization-error bounds for the residual-aware
+# safety margin ρ_k = L_h ( L_x w_bar_k + eps_rec + eps_sens ) + rho_lin
+margin:
+  eps_rec: 0.0
+  # For the CBF margin we bound only [py, vy] sensing/model uncertainty, not
+  # the full six-state observation norm.  This is intentionally smaller than
+  # the old global 0.05 used for every coordinate.
+  eps_sens: 0.02
+  rho_lin: 0.03
+  # Use local ||∇h(x)|| instead of the global spectral L_h bound.  The global
+  # CBF Lipschitz bound is intentionally conservative (~8) and made ρ exceed
+  # h_center during normal driving, forcing emergency lock-in.
+  use_local_lipschitz: true
+  rho_cap: 1.25
+
+logging:
+  out_dir: ./runs
+  save_trajectories: true
+  save_residuals: true

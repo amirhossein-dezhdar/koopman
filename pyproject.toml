@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cr-koop-mpc"
+version = "0.1.0"
+description = "Conformal Residual-Driven Event-Triggered Koopman MPC for Safe Autonomous Driving"
+authors = [{name = "Amir Hossein Dezhdar"}]
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "torch>=2.0",
+    "cvxpy>=1.4",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+metadrive = ["metadrive-simulator>=0.4.2"]
+dev = ["pytest>=7.0", "ruff>=0.1"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cr_koop_mpc*"]
